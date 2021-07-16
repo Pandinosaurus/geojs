@@ -1,6 +1,24 @@
-# Change Log
+# GeoJS Change Log
 
-## Unreleased
+## Version 1.2.0
+
+### Features
+
+- Allow sharing queues between tile layers (#1100)
+- Allow removing promises from the idle monitor (#1101)
+- Improve when tile layers are idle (#1101)
+
+## Version 1.1.0
+
+### Features
+- Added a geoOnce handler for events (#1097)
+
+## Version 1.0.3
+
+### Bug Fixes
+- Have semantic release publish artifacts to the GitHub release (#1094)
+
+## Version 1.0.2
 
 ### Improvements
 - The primary map div now has overflow hidden set on it (#1088)

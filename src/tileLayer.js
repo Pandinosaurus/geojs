@@ -18,12 +18,14 @@ var featureLayer = require('./featureLayer');
  *   zoom level.
  * @property {number} [cacheSize=400] The maximum number of tiles to cache.
  *   The default is 200 if keepLower is false.
+ * @property {geo.fetchQueue} [queue] A fetch queue to use.  If unspecified, a
+ *   new queue is created.
  * @property {number} [queueSize=6] The queue size.  Most browsers make at most
  *   6 requests to any domain, so this should be no more than 6 times the
  *   number of subdomains used.
  * @property {number} [initialQueueSize=0] The initial queue size.  `0` to use
  *   the queue size.  When querying a tile server that needs to load
- *   information before serving the first time, having an initial queue size of
+ *   information before serving the first tile, having an initial queue size of
  *   1 can reduce the load on the tile server.  After the initial queue of
  *   tiles are loaded, the `queueSize` is used for all additional queries
  *   unless the `initialQueueSize` is set again or the tile cache is reset.
@@ -70,6 +72,11 @@ var featureLayer = require('./featureLayer');
  *   bottom-up (the ingcs does not matter, only the gcs coordinate system).
  *   When falsy, this inverts the gcs y-coordinate when calculating local
  *   coordinates.
+ * @property {string} [idleAfter='view'] Consider the layer as idle once a
+ *   specific set of tiles is loaded.  'view' is when all tiles in view are
+ *   loaded.  'all' is when tiles in view and tiles that were once requested
+ *   have been loaded (this corresponds to having all network activity
+ *   finished).
  */
 
 /**
@@ -208,7 +215,9 @@ var tileLayer = function (arg) {
       m_queueSize = arg.queueSize || 6,
       m_initialQueueSize = arg.initialQueueSize || 0,
       m_lastTileSet = [],
+      m_promisedTiles = {},
       m_maxBounds = [],
+      m_reference,
       m_exited,
       m_this = this;
 
@@ -230,7 +239,7 @@ var tileLayer = function (arg) {
   this._cache = tileCache({size: arg.cacheSize});
 
   // initialize the tile fetch queue
-  this._queue = fetchQueue({
+  this._queue = arg.queue || fetchQueue({
     // this should probably be 6 * subdomains.length if subdomains are used
     size: m_queueSize,
     initialSize: m_initialQueueSize,
@@ -239,9 +248,14 @@ var tileLayer = function (arg) {
     // smaller values will do needless computations.
     track: arg.cacheSize,
     needed: function (tile) {
+      if (this._tileLayers && this._tileLayers.length) {
+        return this._tileLayers.some((tl) => tile === tl.cache.get(tile.toString(), true));
+      }
       return tile === m_this.cache.get(tile.toString(), true);
     }
   });
+  this._queue._tileLayers = this._queue._tileLayers || [];
+  this._queue._tileLayers.push(m_this);
 
   var m_tileOffsetValues = {};
 
@@ -276,6 +290,30 @@ var tileLayer = function (arg) {
   }});
 
   /**
+   * Get/set the queue object.
+   * @property {geo.fetchQueue} queue The current queue.
+   * @name geo.tileLayer#queue
+   */
+  Object.defineProperty(this, 'queue', {
+    get: function () { return m_this._queue; },
+    set: function (queue) {
+      /* The queue's needed function determines if a tile is still needed. A
+       * tile in the queue is needed if it is needed by at least one layer that
+       * is using it.  _tileLayers tracks the layers that share the queue to
+       * allow walking through the layers and check if any layer needs a tile.
+       * When the queue is set, maintain the list of joined tile layers. */
+      if (m_this._queue !== queue) {
+        if (this._queue && this._queue._tileLayers && this._queue._tileLayers.indexOf(m_this) >= 0) {
+          this._queue._tileLayers.splice(this._queue._tileLayers.indexOf(m_this), 1);
+        }
+        m_this._queue = queue;
+        m_this._queue._tileLayers = m_this._queue._tileLayers || [];
+        m_this._queue._tileLayers.push(m_this);
+      }
+    }
+  });
+
+  /**
    * Get/set the queue size.
    * @property {number} size The queue size.
    * @name geo.tileLayer#queueSize
@@ -300,6 +338,20 @@ var tileLayer = function (arg) {
       m_initialQueueSize = n || 0;
       m_this._queue.initialSize = n || m_queueSize;
     }
+  });
+
+  /**
+   * Get/set the tile reference value.
+   * @property {string} reference A reference value to distinguish tiles on
+   *    this layer.
+   * @name geo.tileLayer#reference
+   */
+  Object.defineProperty(this, 'reference', {
+    get: function () { return '' + m_this.id() + '_' + (m_reference || 0); },
+    set: function (reference) {
+      m_reference = reference;
+    },
+    configurable: true
   });
 
   /**
@@ -566,11 +618,12 @@ var tileLayer = function (arg) {
    * @param {object} index The tile index
    * @param {number} index.x
    * @param {number} index.y
-   * @param {number} index.level
+   * @param {number} [index.level]
+   * @param {number} [index.reference]
    * @returns {string}
    */
   this._tileHash = function (index) {
-    return [index.level || 0, index.y, index.x].join('_');
+    return [index.level || 0, index.y, index.x, index.reference || 0].join('_');
   };
 
   /**
@@ -663,8 +716,8 @@ var tileLayer = function (arg) {
       // loop over the tile range
       for (i = start.x; i <= end.x; i += 1) {
         for (j = start.y; j <= end.y; j += 1) {
-          index = {level: level, x: i, y: j};
-          source = {level: level, x: i, y: j};
+          index = {level: level, x: i, y: j, reference: m_this.reference};
+          source = {level: level, x: i, y: j, reference: m_this.reference};
           if (m_this._options.wrapX) {
             source.x = modulo(source.x, nTilesLevel.x);
           }
@@ -1258,6 +1311,7 @@ var tileLayer = function (arg) {
 
     tiles.forEach(function (tile) {
       if (tile.fetched()) {
+        delete m_promisedTiles[tile.toString()];
         /* if we have already fetched the tile, we know we can just draw it,
          * as the bounds won't have changed since the call to _getTiles. */
         m_this.drawTile(tile);
@@ -1294,7 +1348,6 @@ var tileLayer = function (arg) {
             m_this._setTileTree(tile);
           });
 
-          m_this.addPromise(tile);
           tile._queued = true;
         } else {
           /* If we are using a fetch queue, tell the queue so this tile can
@@ -1304,6 +1357,8 @@ var tileLayer = function (arg) {
             m_this._queue.add(tile);
           }
         }
+        m_this.addPromise(tile);
+        m_promisedTiles[tile.toString()] = tile;
       }
     });
     // purge all old tiles when the new tiles are loaded (successfully or not)
@@ -1316,6 +1371,17 @@ var tileLayer = function (arg) {
           m_this._purge(zoom, true);
         }
       );
+    // for tiles that aren't in view, remove them from the list of tiles that
+    // are needed to be loaded to be considered idle.
+    if (m_this._options.idleAfter !== 'all') {
+      for (const hash in m_promisedTiles) {
+        const tile = m_promisedTiles[hash];
+        if (tiles.indexOf(tile) < 0) {
+          m_this.removePromise(tile);
+          delete m_promisedTiles[hash];
+        }
+      }
+    }
     return m_this;
   };
 
@@ -1459,7 +1525,7 @@ var tileLayer = function (arg) {
     } else {
       /* For tile layers that should only keep one layer, if loading is
        * finished, purge all but the current layer.  This is important for
-       * semi-transparanet layers. */
+       * semi-transparent layers. */
       if ((doneLoading || m_this._isCovered(tile)) &&
           zoom !== tile.index.level) {
         return true;
@@ -1622,6 +1688,9 @@ var tileLayer = function (arg) {
     // call super method
     s_exit.apply(m_this, arguments);
     m_exited = true;
+    if (this._queue && this._queue._tileLayers && this._queue._tileLayers.indexOf(m_this) >= 0) {
+      this._queue._tileLayers.splice(this._queue._tileLayers.indexOf(m_this), 1);
+    }
     return m_this;
   };
 
@@ -1649,6 +1718,7 @@ tileLayer.defaults = {
   tilesMaxBounds: null,
   topDown: false,
   keepLower: true,
+  idleAfter: 'view',
   // cacheSize: 400,  // set depending on keepLower
   tileRounding: Math.round,
   attribution: '',
